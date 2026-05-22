@@ -6,8 +6,12 @@ import requests
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import os
+from pathlib import Path
 from datetime import datetime, date
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
+import io
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -16,12 +20,24 @@ REQUEST_HEADERS = {
         "Chrome/124.0 Safari/537.36"
     )
 }
+FINMIND_WORKERS = 4
+ENABLE_SLOW_TWSE_FALLBACK = False
+TWSE_FALLBACK_WORKERS = 4
 
 # ==========================================
 # 1. 初始化與中文字型設定
 # ==========================================
 st.set_page_config(page_title="全市場 ETF 潛力掃描器", layout="wide")
 st.title("🔍 全市場 ETF / ETN 潛力即時強弱勢掃描器")
+
+FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "")
+if not FINMIND_TOKEN:
+    secrets_paths = [
+        Path.home() / ".streamlit" / "secrets.toml",
+        Path.cwd() / ".streamlit" / "secrets.toml",
+    ]
+    if any(path.exists() for path in secrets_paths):
+        FINMIND_TOKEN = st.secrets.get("FINMIND_TOKEN", "")
 
 @st.cache_resource
 def load_font():
@@ -144,6 +160,10 @@ def fetch_twse_price(stock_id: str, start_date: str, end_date: str) -> pd.DataFr
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_finmind_price(stock_id: str, start_date: str, end_date: str) -> pd.DataFrame:
     """Fetch daily close prices from FinMind as a broad Taiwan-market fallback."""
+    return _fetch_finmind_price_uncached(stock_id, start_date, end_date)
+
+
+def _fetch_finmind_price_uncached(stock_id: str, start_date: str, end_date: str) -> pd.DataFrame:
     try:
         r = requests.get(
             "https://api.finmindtrade.com/api/v4/data",
@@ -152,6 +172,7 @@ def fetch_finmind_price(stock_id: str, start_date: str, end_date: str) -> pd.Dat
                 "data_id": stock_id,
                 "start_date": start_date,
                 "end_date": end_date,
+                **({"token": FINMIND_TOKEN} if FINMIND_TOKEN else {}),
             },
             headers=REQUEST_HEADERS,
             timeout=12,
@@ -171,6 +192,13 @@ def fetch_finmind_price(stock_id: str, start_date: str, end_date: str) -> pd.Dat
         return df[["close"]].rename(columns={"close": stock_id})
     except Exception:
         return pd.DataFrame()
+
+
+def _fetch_fallback_price(ticker: str, start_date: str, end_date: str, use_twse: bool = False) -> pd.DataFrame:
+    price_df = _fetch_finmind_price_uncached(ticker, start_date, end_date)
+    if price_df.empty and use_twse:
+        price_df = fetch_twse_price(ticker, start_date, end_date)
+    return price_df
 
 
 # ==========================================
@@ -316,6 +344,24 @@ def _extract_yf_close(raw: pd.DataFrame, symbol: str) -> pd.Series:
     return pd.Series(dtype="float64")
 
 
+def _quiet_yf_download(symbols, start, end):
+    """yfinance prints noisy per-symbol failures; keep the UI/log focused on our fallback path."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return yf.download(
+                symbols,
+                start=start,
+                end=end,
+                progress=False,
+                auto_adjust=True,
+                group_by='ticker',
+                timeout=10,
+                threads=False,
+            )
+    except Exception:
+        return pd.DataFrame()
+
+
 def _merge_price_frame(master_df: pd.DataFrame, price_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if price_df is None or price_df.empty or ticker not in price_df.columns:
         return master_df
@@ -330,6 +376,7 @@ def _merge_price_frame(master_df: pd.DataFrame, price_df: pd.DataFrame, ticker: 
 
 def load_master_market_data(tickers, preload_start, preload_end):
     master_df = pd.DataFrame()
+    price_series = {}
     unresolved_tickers = set(tickers)
     
     BATCH_SIZE = 50  # 每批 50 檔
@@ -342,57 +389,93 @@ def load_master_market_data(tickers, preload_start, preload_end):
             text=f"📥 下載第 {b_idx+1}/{len(batches)} 批（共 {len(batch)} 檔）"
         )
         
-        # 同時嘗試 .TW 和 .TWO
-        symbols_tw  = [f"{t}.TW"  for t in batch]
-        symbols_two = [f"{t}.TWO" for t in batch]
-        
-        for symbols in [symbols_tw, symbols_two]:
-            try:
-                raw = yf.download(
-                    symbols, start=preload_start, end=preload_end,
-                    progress=False, auto_adjust=True, group_by='ticker',
-                    timeout=10  # 整批只等 10 秒
-                )
-                if raw.empty:
-                    continue
-                    
-                # 從批次結果裡逐一取出各代號的 Close
-                for sym in symbols:
-                    ticker = sym.replace('.TW', '').replace('.TWO', '')
-                    if ticker in master_df.columns:
-                        continue  # 已有資料就跳過
-                    series = _extract_yf_close(raw, sym)
-                    if not series.empty:
-                        master_df[ticker] = series
-                        unresolved_tickers.discard(ticker)
-            except Exception:
-                pass
+        # ETF / ETN mostly trade on TWSE. Trying .TWO for every symbol doubles Yahoo calls
+        # and quickly triggers rate limits, so let FinMind handle Yahoo misses instead.
+        symbols_tw = [f"{t}.TW" for t in batch]
+        raw = _quiet_yf_download(symbols_tw, preload_start, preload_end)
+        if raw.empty:
+            continue
+
+        # 從批次結果裡逐一取出各代號的 Close
+        for sym in symbols_tw:
+            ticker = sym.replace('.TW', '')
+            if ticker in price_series:
+                continue  # 已有資料就跳過
+            series = _extract_yf_close(raw, sym)
+            if not series.empty:
+                price_series[ticker] = series
+                unresolved_tickers.discard(ticker)
     
     fallback_tickers = [t for t in tickers if t in unresolved_tickers]
     if fallback_tickers:
-        fallback_bar = st.progress(0, text="🔁 Yahoo 未取得者，改用 FinMind / TWSE 備援...")
+        fallback_bar = st.progress(0, text="🔁 Yahoo 未取得者，並行改用 FinMind 備援...")
         total_fallback = len(fallback_tickers)
+        done_count = 0
 
-        for idx, ticker in enumerate(fallback_tickers):
-            fallback_bar.progress(
-                int((idx + 1) / total_fallback * 100),
-                text=f"🔁 備援抓取 {idx+1}/{total_fallback}: {ticker}"
+        with ThreadPoolExecutor(max_workers=FINMIND_WORKERS) as executor:
+            futures = {
+                executor.submit(_fetch_fallback_price, ticker, preload_start, preload_end, False): ticker
+                for ticker in fallback_tickers
+            }
+            for future in as_completed(futures):
+                ticker = futures[future]
+                done_count += 1
+                fallback_bar.progress(
+                    int(done_count / total_fallback * 100),
+                    text=f"🔁 FinMind 備援 {done_count}/{total_fallback}: {ticker}"
+                )
+
+                price_df = future.result()
+                if price_df is not None and not price_df.empty and ticker in price_df.columns:
+                    series = price_df[ticker].dropna()
+                else:
+                    series = pd.Series(dtype="float64")
+                if not series.empty:
+                    price_series[ticker] = series
+                    unresolved_tickers.discard(ticker)
+
+        twse_tickers = [t for t in fallback_tickers if t in unresolved_tickers]
+        if twse_tickers and not ENABLE_SLOW_TWSE_FALLBACK:
+            st.info(
+                f"⏩ 已跳過 {len(twse_tickers)} 檔慢速 TWSE 月資料備援。"
+                "若要最大化資料完整度，可在程式中將 ENABLE_SLOW_TWSE_FALLBACK 改為 True。"
             )
+        elif twse_tickers:
+            fallback_bar.progress(
+                0,
+                text=f"🔁 FinMind 仍無資料的 {len(twse_tickers)} 檔，改用 TWSE 官方資料..."
+            )
+            total_twse = len(twse_tickers)
+            done_count = 0
 
-            price_df = fetch_finmind_price(ticker, preload_start, preload_end)
-            if price_df.empty:
-                price_df = fetch_twse_price(ticker, preload_start, preload_end)
+            with ThreadPoolExecutor(max_workers=TWSE_FALLBACK_WORKERS) as executor:
+                futures = {
+                    executor.submit(fetch_twse_price, ticker, preload_start, preload_end): ticker
+                    for ticker in twse_tickers
+                }
+                for future in as_completed(futures):
+                    ticker = futures[future]
+                    done_count += 1
+                    fallback_bar.progress(
+                        int(done_count / total_twse * 100),
+                        text=f"🔁 TWSE 備援 {done_count}/{total_twse}: {ticker}"
+                    )
 
-            before_cols = set(master_df.columns)
-            master_df = _merge_price_frame(master_df, price_df, ticker)
-            if ticker in master_df.columns and ticker not in before_cols:
-                unresolved_tickers.discard(ticker)
-
-            time.sleep(0.08)
+                    price_df = future.result()
+                    if price_df is not None and not price_df.empty and ticker in price_df.columns:
+                        series = price_df[ticker].dropna()
+                    else:
+                        series = pd.Series(dtype="float64")
+                    if not series.empty:
+                        price_series[ticker] = series
+                        unresolved_tickers.discard(ticker)
 
         fallback_bar.empty()
 
     my_bar.empty()
+
+    if price_series:
+        master_df = pd.concat(price_series, axis=1)
 
     failed_tickers = [t for t in tickers if t in unresolved_tickers]
     if failed_tickers:
