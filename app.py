@@ -19,13 +19,20 @@ st.title("🔍 全市場 ETF / ETN 潛力即時強弱勢掃描器")
 def load_font():
     font_path = 'NotoSansTC-Regular.ttf'
     if os.path.exists(font_path):
-        return fm.FontProperties(fname=font_path)
+        # 關鍵：強制將字型加入 matplotlib 的字型庫中
+        fm.fontManager.addfont(font_path)
+        prop = fm.FontProperties(fname=font_path)
+        return prop.get_name() # 回傳註冊後的正式名稱
     return None
 
-font_prop = load_font()
-if font_prop:
-    plt.rcParams['font.sans-serif'] = [font_prop.get_name()]
+font_name = load_font()
+if font_name:
+    # 系統成功註冊後，再套用全域設定
+    plt.rcParams['font.sans-serif'] = [font_name]
     plt.rcParams['axes.unicode_minus'] = False
+else:
+    st.warning("⚠️ 找不到 NotoSansTC-Regular.ttf，請確認字型檔已上傳至 GitHub 根目錄。")
+
 
 # ==========================================
 # 2. 資料源驅動：FinMind 單獨補網功能
