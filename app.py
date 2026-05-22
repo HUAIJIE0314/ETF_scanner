@@ -23,9 +23,8 @@ REQUEST_HEADERS = {
 FINMIND_WORKERS = 4
 ENABLE_SLOW_TWSE_FALLBACK = False
 TWSE_FALLBACK_WORKERS = 4
-TWSE_MARKET_WORKERS = 2
-STALE_DATA_GRACE_DAYS = 10
-DATA_CACHE_VERSION = "2026-05-23-twse-primary-retry-v6"
+TWSE_MARKET_WORKERS = 8
+DATA_CACHE_VERSION = "2026-05-23-return-no-fill-v2"
 
 # ==========================================
 # 1. 初始化與中文字型設定
@@ -228,39 +227,38 @@ def _fetch_fallback_price(ticker: str, start_date: str, end_date: str, use_twse:
 
 def _fetch_twse_market_day(day: pd.Timestamp, wanted_tickers: set) -> dict:
     date_str = day.strftime("%Y%m%d")
-    for attempt in range(3):
-        try:
-            r = requests.get(
-                "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
-                params={"date": date_str, "type": "ALLBUT0999", "response": "json"},
-                headers=REQUEST_HEADERS,
-                timeout=15,
-            )
-            data = r.json()
-            if data.get("stat") not in (None, "OK"):
-                return {}
+    try:
+        r = requests.get(
+            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+            params={"date": date_str, "type": "ALLBUT0999", "response": "json"},
+            headers=REQUEST_HEADERS,
+            timeout=12,
+        )
+        data = r.json()
+        if data.get("stat") not in (None, "OK"):
+            return {}
 
-            for table in data.get("tables", []):
-                fields = table.get("fields", [])
-                if "證券代號" not in fields or "收盤價" not in fields:
+        for table in data.get("tables", []):
+            fields = table.get("fields", [])
+            if "證券代號" not in fields or "收盤價" not in fields:
+                continue
+
+            code_idx = fields.index("證券代號")
+            close_idx = fields.index("收盤價")
+            prices = {}
+            for row in table.get("data", []):
+                if len(row) <= max(code_idx, close_idx):
                     continue
-
-                code_idx = fields.index("證券代號")
-                close_idx = fields.index("收盤價")
-                prices = {}
-                for row in table.get("data", []):
-                    if len(row) <= max(code_idx, close_idx):
-                        continue
-                    ticker = str(row[code_idx]).strip()
-                    if ticker not in wanted_tickers:
-                        continue
-                    close_text = str(row[close_idx]).replace(",", "").strip()
-                    close = pd.to_numeric(close_text, errors="coerce")
-                    if pd.notna(close):
-                        prices[ticker] = float(close)
-                return prices
-        except Exception:
-            time.sleep(0.5 * (attempt + 1))
+                ticker = str(row[code_idx]).strip()
+                if ticker not in wanted_tickers:
+                    continue
+                close_text = str(row[close_idx]).replace(",", "").strip()
+                close = pd.to_numeric(close_text, errors="coerce")
+                if pd.notna(close):
+                    prices[ticker] = float(close)
+            return prices
+    except Exception:
+        return {}
 
     return {}
 
@@ -409,7 +407,7 @@ def _batch_download(tickers_tw, start, end):
     return raw
 
 
-def _extract_yf_close(raw: pd.DataFrame, symbol: str, allow_single_level: bool = False) -> pd.Series:
+def _extract_yf_close(raw: pd.DataFrame, symbol: str) -> pd.Series:
     """Handle both yfinance MultiIndex layouts: (ticker, field) and (field, ticker)."""
     if raw is None or raw.empty:
         return pd.Series(dtype="float64")
@@ -433,9 +431,9 @@ def _extract_yf_close(raw: pd.DataFrame, symbol: str, allow_single_level: bool =
 
             return pd.Series(dtype="float64")
 
-        if allow_single_level and "Close" in raw.columns:
+        if "Close" in raw.columns:
             return raw["Close"].dropna()
-        if allow_single_level and "Adj Close" in raw.columns:
+        if "Adj Close" in raw.columns:
             return raw["Adj Close"].dropna()
     except Exception:
         return pd.Series(dtype="float64")
@@ -461,14 +459,6 @@ def _quiet_yf_download(symbols, start, end):
         return pd.DataFrame()
 
 
-def is_series_stale(series: pd.Series, end_date: str, grace_days: int = STALE_DATA_GRACE_DAYS) -> bool:
-    if series is None or series.empty:
-        return True
-    latest = pd.to_datetime(series.index.max()).tz_localize(None)
-    expected_end = pd.to_datetime(end_date).tz_localize(None)
-    return latest < expected_end - pd.Timedelta(days=grace_days)
-
-
 def _merge_price_frame(master_df: pd.DataFrame, price_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if price_df is None or price_df.empty or ticker not in price_df.columns:
         return master_df
@@ -485,31 +475,10 @@ def load_master_market_data(tickers, preload_start, preload_end):
     master_df = pd.DataFrame()
     price_series = {}
     unresolved_tickers = set(tickers)
-
-    my_bar = st.progress(0, text="📥 使用 TWSE 全市場資料下載歷史價格...")
-    twse_market_df = fetch_twse_market_prices(
-        tickers,
-        preload_start,
-        preload_end,
-        progress_bar=my_bar,
-    )
-    if not twse_market_df.empty:
-        for ticker in twse_market_df.columns:
-            series = twse_market_df[ticker].dropna()
-            if not series.empty:
-                price_series[ticker] = series
-                unresolved_tickers.discard(ticker)
-
-    fallback_tickers = [t for t in tickers if t in unresolved_tickers]
-    if not fallback_tickers:
-        my_bar.empty()
-        master_df = pd.concat(price_series, axis=1)
-        master_df.index = pd.to_datetime(master_df.index)
-        return master_df.sort_index()
-
+    
     BATCH_SIZE = 50  # 每批 50 檔
-    batches = [fallback_tickers[i:i+BATCH_SIZE] for i in range(0, len(fallback_tickers), BATCH_SIZE)]
-    my_bar.progress(0, text=f"📥 TWSE 未取得的 {len(fallback_tickers)} 檔，改用 Yahoo 補洞...")
+    batches = [tickers[i:i+BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
+    my_bar = st.progress(0, text="📥 批次下載中...")
 
     for b_idx, batch in enumerate(batches):
         my_bar.progress(
@@ -532,8 +501,7 @@ def load_master_market_data(tickers, preload_start, preload_end):
             series = _extract_yf_close(raw, sym)
             if not series.empty:
                 price_series[ticker] = series
-                if not is_series_stale(series, preload_end):
-                    unresolved_tickers.discard(ticker)
+                unresolved_tickers.discard(ticker)
     
     fallback_tickers = [t for t in tickers if t in unresolved_tickers]
     if fallback_tickers:
@@ -563,8 +531,7 @@ def load_master_market_data(tickers, preload_start, preload_end):
                         series = pd.Series(dtype="float64")
                     if not series.empty:
                         price_series[ticker] = series
-                        if not is_series_stale(series, preload_end):
-                            unresolved_tickers.discard(ticker)
+                        unresolved_tickers.discard(ticker)
         else:
             st.info("ℹ️ FinMind 目前不可用或已達請求上限，改用 TWSE 全市場資料備援。")
 
@@ -585,8 +552,7 @@ def load_master_market_data(tickers, preload_start, preload_end):
                     series = twse_market_df[ticker].dropna()
                     if not series.empty:
                         price_series[ticker] = series
-                        if not is_series_stale(series, preload_end):
-                            unresolved_tickers.discard(ticker)
+                        unresolved_tickers.discard(ticker)
 
         slow_twse_tickers = [t for t in fallback_tickers if t in unresolved_tickers]
         if slow_twse_tickers and not ENABLE_SLOW_TWSE_FALLBACK:
@@ -830,3 +796,4 @@ if not df_res.empty:
 
 else:
     st.warning("選定時間區間內無足夠數據進行運算，請重新調整時間軸。")
+
