@@ -264,7 +264,7 @@ if not df_res.empty:
                 
             ax.text(width + offset, bar.get_y() + bar.get_height()/2., label,
                     ha=align, va='center', fontweight='bold',
-                    fontproperties=font_prop if font_prop else None)
+                    fontfamily=font_name if font_name else None)
             
         ax.axvline(0, color='black', linewidth=0.8)
         ax.grid(axis='x', linestyle='--', alpha=0.5)
