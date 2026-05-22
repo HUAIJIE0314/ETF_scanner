@@ -9,6 +9,14 @@ import os
 from datetime import datetime, date
 import time
 
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    )
+}
+
 # ==========================================
 # 1. 初始化與中文字型設定
 # ==========================================
@@ -99,7 +107,7 @@ def fetch_twse_price(stock_id: str, start_date: str, end_date: str) -> pd.DataFr
                 f"?response=json&date={date_str}&stockNo={stock_id}"
             )
             try:
-                r = requests.get(url, timeout=10)
+                r = requests.get(url, headers=REQUEST_HEADERS, timeout=10)
                 data = r.json()
                 if data.get("stat") == "OK":
                     for row in data.get("data", []):
@@ -131,6 +139,38 @@ def fetch_twse_price(stock_id: str, start_date: str, end_date: str) -> pd.DataFr
     df = df.set_index("date").sort_index()
     df = df[~df.index.duplicated(keep='last')]
     return df[["close"]].rename(columns={"close": stock_id})
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_finmind_price(stock_id: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch daily close prices from FinMind as a broad Taiwan-market fallback."""
+    try:
+        r = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params={
+                "dataset": "TaiwanStockPrice",
+                "data_id": stock_id,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+            headers=REQUEST_HEADERS,
+            timeout=12,
+        )
+        data = r.json()
+        if data.get("msg") != "success" or not data.get("data"):
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data["data"])
+        if "date" not in df.columns or "close" not in df.columns:
+            return pd.DataFrame()
+
+        df["date"] = pd.to_datetime(df["date"])
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df = df.dropna(subset=["close"]).set_index("date").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        return df[["close"]].rename(columns={"close": stock_id})
+    except Exception:
+        return pd.DataFrame()
 
 
 # ==========================================
@@ -241,9 +281,56 @@ def _batch_download(tickers_tw, start, end):
                       group_by='ticker')
     return raw
 
+
+def _extract_yf_close(raw: pd.DataFrame, symbol: str) -> pd.Series:
+    """Handle both yfinance MultiIndex layouts: (ticker, field) and (field, ticker)."""
+    if raw is None or raw.empty:
+        return pd.Series(dtype="float64")
+
+    try:
+        if isinstance(raw.columns, pd.MultiIndex):
+            level0 = raw.columns.get_level_values(0)
+            level1 = raw.columns.get_level_values(1)
+
+            if symbol in level0:
+                symbol_df = raw[symbol]
+                if "Close" in symbol_df.columns:
+                    return symbol_df["Close"].dropna()
+                if "Adj Close" in symbol_df.columns:
+                    return symbol_df["Adj Close"].dropna()
+
+            if "Close" in level0 and symbol in level1:
+                return raw["Close"][symbol].dropna()
+            if "Adj Close" in level0 and symbol in level1:
+                return raw["Adj Close"][symbol].dropna()
+
+            return pd.Series(dtype="float64")
+
+        if "Close" in raw.columns:
+            return raw["Close"].dropna()
+        if "Adj Close" in raw.columns:
+            return raw["Adj Close"].dropna()
+    except Exception:
+        return pd.Series(dtype="float64")
+
+    return pd.Series(dtype="float64")
+
+
+def _merge_price_frame(master_df: pd.DataFrame, price_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if price_df is None or price_df.empty or ticker not in price_df.columns:
+        return master_df
+
+    series = price_df[ticker].dropna()
+    if series.empty:
+        return master_df
+
+    master_df[ticker] = series
+    return master_df
+
+
 def load_master_market_data(tickers, preload_start, preload_end):
     master_df = pd.DataFrame()
-    failed_tickers = []
+    unresolved_tickers = set(tickers)
     
     BATCH_SIZE = 50  # 每批 50 檔
     batches = [tickers[i:i+BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
@@ -274,23 +361,40 @@ def load_master_market_data(tickers, preload_start, preload_end):
                     ticker = sym.replace('.TW', '').replace('.TWO', '')
                     if ticker in master_df.columns:
                         continue  # 已有資料就跳過
-                    try:
-                        if isinstance(raw.columns, pd.MultiIndex):
-                            series = raw['Close'][sym].dropna()
-                        else:
-                            series = raw['Close'].dropna()
-                        
-                        if not series.empty:
-                            master_df[ticker] = series
-                        else:
-                            failed_tickers.append(ticker)
-                    except Exception:
-                        failed_tickers.append(ticker)
+                    series = _extract_yf_close(raw, sym)
+                    if not series.empty:
+                        master_df[ticker] = series
+                        unresolved_tickers.discard(ticker)
             except Exception:
                 pass
     
+    fallback_tickers = [t for t in tickers if t in unresolved_tickers]
+    if fallback_tickers:
+        fallback_bar = st.progress(0, text="🔁 Yahoo 未取得者，改用 FinMind / TWSE 備援...")
+        total_fallback = len(fallback_tickers)
+
+        for idx, ticker in enumerate(fallback_tickers):
+            fallback_bar.progress(
+                int((idx + 1) / total_fallback * 100),
+                text=f"🔁 備援抓取 {idx+1}/{total_fallback}: {ticker}"
+            )
+
+            price_df = fetch_finmind_price(ticker, preload_start, preload_end)
+            if price_df.empty:
+                price_df = fetch_twse_price(ticker, preload_start, preload_end)
+
+            before_cols = set(master_df.columns)
+            master_df = _merge_price_frame(master_df, price_df, ticker)
+            if ticker in master_df.columns and ticker not in before_cols:
+                unresolved_tickers.discard(ticker)
+
+            time.sleep(0.08)
+
+        fallback_bar.empty()
+
     my_bar.empty()
 
+    failed_tickers = [t for t in tickers if t in unresolved_tickers]
     if failed_tickers:
         st.warning(
             f"⚠️ 以下 {len(failed_tickers)} 檔三引擎均無法取得資料"
