@@ -223,6 +223,10 @@ for ticker in sliced_df.columns:
     p_start = float(series.iloc[0])
     p_end = float(series.iloc[-1])
     
+    # 【新增這兩行】：防止價格為 0 導致系統崩潰
+    if p_start == 0 or pd.isna(p_start):
+        continue
+        
     # 1. 計算區間報酬率
     return_pct = ((p_end - p_start) / p_start) * 100
     
