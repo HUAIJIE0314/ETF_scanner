@@ -58,62 +58,46 @@ def get_finmind_price(ticker, start_date, end_date):
     return pd.DataFrame()
 
 # ==========================================
-# 3. 核心大數據預載機制 (動態快取 + 防封鎖延遲)
+# 3. 核心大數據預載機制 (全線改用 FinMind 防封鎖)
 # ==========================================
 @st.cache_data(show_spinner=True)
 def load_master_market_data(tickers, preload_start, preload_end):
-    yf_tickers = [t for t in tickers if ".TW" in t or ".TWO" in t]
-    other_tickers = [t for t in tickers if t not in yf_tickers]
-    
     master_df = pd.DataFrame()
     
-    # 建立一個帶有瀏覽器偽裝的 Session
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-    })
+    # 建立進度提示，讓你知道目前抓到哪一檔
+    progress_text = "📥 正在向 FinMind 請求歷史數據..."
+    my_bar = st.progress(0, text=progress_text)
     
-    # 1. 放棄批量，改為單檔逐一下載 (最安全)
-    for ticker in yf_tickers:
-        try:
-            # 傳入偽裝的 session，並關閉 progress bar
-            yf_data = yf.download(ticker, start=preload_start, end=preload_end, progress=False, session=session)
-            
-            if not yf_data.empty:
-                # 處理欄位
-                if isinstance(yf_data.columns, pd.MultiIndex):
-                    price_col = 'Adj Close' if 'Adj Close' in yf_data.columns.levels[0] else 'Close'
-                    temp_df = yf_data[price_col].copy()
-                else:
-                    temp_df = yf_data['Close'].to_frame()
-                    
-                temp_df.columns = [ticker] # 強制重新命名欄位為股票代號
-                    
-                if master_df.empty:
-                    master_df = temp_df
-                else:
-                    master_df = master_df.join(temp_df, how='outer')
-                    
-            # 雲端環境建議每抓一檔休息 0.5 到 1 秒
-            time.sleep(0.5) 
-            
-        except Exception as e:
-            # 靜默處理單檔失敗，不影響全局
-            pass
-            
-    # 2. FinMind 逐筆下載
-    for ticker in other_tickers:
-        fm_df = get_finmind_price(ticker, preload_start, preload_end)
-        if not fm_df.empty:
-            if master_df.empty:
-                master_df = fm_df
-            else:
-                master_df = master_df.join(fm_df, how='outer')
+    for i, ticker in enumerate(tickers):
+        # 更新進度條
+        percent_complete = int(((i + 1) / len(tickers)) * 100)
+        my_bar.progress(percent_complete, text=f"📥 正在下載: {ticker} ({i+1}/{len(tickers)})")
         
+        try:
+            # 全部交給 FinMind 抓取 (函數內會自動濾除 .TW 後綴)
+            fm_df = get_finmind_price(ticker, preload_start, preload_end)
+            
+            if not fm_df.empty:
+                if master_df.empty:
+                    master_df = fm_df
+                else:
+                    # 使用 outer join 合併每一檔股票的時間軸
+                    master_df = master_df.join(fm_df, how='outer')
+            else:
+                st.warning(f"⚠️ 查無資料或抓取失敗: {ticker}")
+                
+        except Exception as e:
+            st.error(f"❌ {ticker} 發生錯誤: {e}")
+            
+        # 禮貌性延遲 1 秒，避免觸發 FinMind 的頻率限制
         time.sleep(1)
+        
+    # 清除進度條
+    my_bar.empty()
                 
     if not master_df.empty:
         master_df.index = pd.to_datetime(master_df.index)
+        # 向下/向上填補因各自休市或上市日不同造成的空值
         master_df = master_df.sort_index().ffill().bfill()
         
     return master_df
