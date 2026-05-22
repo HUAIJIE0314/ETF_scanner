@@ -90,7 +90,7 @@ def load_master_market_data(tickers, preload_start, preload_end):
             st.error(f"❌ {ticker} 發生錯誤: {e}")
             
         # 禮貌性延遲 1 秒，避免觸發 FinMind 的頻率限制
-        time.sleep(1)
+        # time.sleep(1)
         
     # 清除進度條
     my_bar.empty()
@@ -102,21 +102,42 @@ def load_master_market_data(tickers, preload_start, preload_end):
         
     return master_df
 
+
 # ==========================================
-# 4. 定義全市場掃描標的池 (可自由擴充)
+# 4. 動態取得全市場 ETF / ETN 代號清單
 # ==========================================
-# 納入市值型、高股息、科技、美股槓桿、台股正二、以及 yfinance 找不到的 ETN
-TICKER_POOL = [
-    "0050.TW", "0056.TW", "006208.TW", "00878.TW", "00919.TW", "00929.TW", 
-    "00631L.TW", "00632R.TW", "00675L.TW", "00757.TW", "00893.TW", "00679B.TW", 
-    "02001L" # 富邦蘋果正二N (走 FinMind 備援通道)
-]
+@st.cache_data(show_spinner=False)
+def get_all_etf_tickers():
+    url = "https://api.finmindtrade.com/api/v4/data"
+    parameter = {
+        "dataset": "TaiwanStockInfo"
+    }
+    try:
+        r = requests.get(url, params=parameter, timeout=10)
+        data = r.json()
+        if data.get('msg') == 'success' and len(data.get('data', [])) > 0:
+            df = pd.DataFrame(data['data'])
+            # 台股的 ETF 通常以 00 開頭，ETN 以 02 開頭
+            # 利用字串篩選把全市場符合條件的代號全部抓出來
+            etf_etn_df = df[df['stock_id'].str.startswith(('00', '02'))]
+            tickers = etf_etn_df['stock_id'].tolist()
+            return list(set(tickers)) # 用 set 確保沒有重複代號
+    except Exception as e:
+        st.error(f"取得市場清單失敗: {e}")
+        
+    # 萬一 API 掛掉的保底名單
+    return ["0050", "0056", "02001L", "00631L"]
+
+with st.spinner("🔍 正在掃描台股全市場 ETF/ETN 代號清單..."):
+    TICKER_POOL = get_all_etf_tickers()
+
+st.info(f"✅ 系統已鎖定全市場共 {len(TICKER_POOL)} 檔 ETF/ETN，準備開始下載歷史數據...")
 
 # 決定大視窗資料範圍（預載 2023 至今的所有數據）
 PRELOAD_START = "2023-01-01"
 PRELOAD_END = datetime.today().strftime("%Y-%m-%d")
 
-with st.spinner("📥 正在初始化全市場歷史數據快取（僅在首次啟動時執行）..."):
+with st.spinner("📥 正在初始化全市場歷史數據快取（這大約需要 3~5 分鐘，請耐心等候）..."):
     master_data = load_master_market_data(TICKER_POOL, PRELOAD_START, PRELOAD_END)
 
 if master_data.empty:
