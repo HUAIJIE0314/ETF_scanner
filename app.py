@@ -178,22 +178,47 @@ def is_valid_etf_ticker(ticker: str) -> bool:
 # ==========================================
 @st.cache_data(show_spinner=False)
 def get_all_etf_tickers():
-    url = "https://api.finmindtrade.com/api/v4/data"
-    parameter = {"dataset": "TaiwanStockInfo"}
-    try:
-        r = requests.get(url, params=parameter, timeout=10)
-        data = r.json()
-        if data.get('msg') == 'success' and len(data.get('data', [])) > 0:
-            df = pd.DataFrame(data['data'])
-            etf_etn_df = df[df['stock_id'].str.startswith(('00', '02'))]
-            tickers = etf_etn_df['stock_id'].tolist()
-            # 【修正】過濾非標準代號
-            tickers = [t for t in set(tickers) if is_valid_etf_ticker(t)]
-            return sorted(tickers)
-    except Exception as e:
-        st.error(f"取得市場清單失敗: {e}")
+    tickers = set()
 
-    return ["0050", "0056", "00631L", "00940"]
+    # ── 來源 1：TWSE 上市 ETF 官方清單 ──
+    try:
+        r = requests.get(
+            "https://openapi.twse.com.tw/v1/ETFtoStock/ALL",
+            timeout=10
+        )
+        data = r.json()
+        for item in data:
+            sid = item.get("SecuritiesCompanyCode", "").strip()
+            if sid:
+                tickers.add(sid)
+    except Exception as e:
+        st.warning(f"TWSE 上市清單取得失敗: {e}")
+
+    # ── 來源 2：TPEx 上櫃 ETF 官方清單 ──
+    try:
+        r = requests.get(
+            "https://www.tpex.org.tw/openapi/v1/tpex_etf_list",
+            timeout=10
+        )
+        data = r.json()
+        for item in data:
+            # 上櫃 API 欄位名稱略不同
+            sid = (
+                item.get("SecuritiesCompanyCode")
+                or item.get("stock_code")
+                or item.get("Code", "")
+            ).strip()
+            if sid:
+                tickers.add(sid)
+    except Exception as e:
+        st.warning(f"TPEx 上櫃清單取得失敗: {e}")
+
+    # ── 萬一兩個都掛，用保底清單 ──
+    if not tickers:
+        st.error("無法從官方取得 ETF 清單，使用保底名單。")
+        return ["0050", "0056", "00631L", "00940", "00878", "006208"]
+
+    return sorted(tickers)
 
 
 with st.spinner("🔍 正在掃描台股全市場 ETF/ETN 代號清單..."):
@@ -281,8 +306,12 @@ def load_master_market_data(tickers, preload_start, preload_end):
     return master_df
 
 
-with st.spinner("📥 正在初始化全市場歷史數據快取（首次約需 3~5 分鐘）..."):
-    master_data = load_master_market_data(TICKER_POOL, PRELOAD_START, PRELOAD_END)
+# with st.spinner("📥 正在初始化全市場歷史數據快取（首次約需 3~5 分鐘）..."):
+#     master_data = load_master_market_data(TICKER_POOL, PRELOAD_START, PRELOAD_END)
+
+# ✅ 新：只用內部的 st.progress()，外層不加 spinner
+master_data = load_master_market_data(TICKER_POOL, PRELOAD_START, PRELOAD_END)
+
 
 if master_data.empty:
     st.error("無法載入基礎市場數據，請檢查網路連線。")
