@@ -666,12 +666,6 @@ if start_input > end_input:
 start_pick = pd.to_datetime(start_input)
 end_pick   = pd.to_datetime(end_input)
 
-sort_by = st.sidebar.selectbox(
-    "關鍵潛力指標排序基準",
-    options=["區間報酬率%", "最大回撤(MDD)%", "最後收盤價"],
-    index=0
-)
-
 # 側邊欄：手動清除快取重新下載按鈕
 if st.sidebar.button("🔄 重新下載最新數據"):
     del st.session_state["master_data"]
@@ -745,15 +739,14 @@ df_res = pd.DataFrame(analysis_results)
 # 9. 前端視覺化
 # ==========================================
 if not df_res.empty:
-    ascending = (sort_by == "最大回撤(MDD)%")  # MDD 越接近 0 越好（ascending=False 時數值越大排越前）
-    df_res = df_res.sort_values(by=sort_by, ascending=ascending).reset_index(drop=True)
+    df_res = df_res.sort_values(by="區間報酬率%", ascending=False).reset_index(drop=True)
 
     global_baseline = df_res["實際資料起點"].min()
 
     col1, col2 = st.columns([1, 1])
 
     with col1:
-        st.subheader(f"📊 潛力排行榜 (依 {sort_by} 排序)")
+        st.subheader("📊 潛力排行榜 (依區間報酬率排序)")
         st.dataframe(
             df_res.style.format({
                 "起點價格":       "{:.2f}",
@@ -792,10 +785,15 @@ if not df_res.empty:
             color=plot_colors, edgecolor='black', alpha=0.7
         )
 
+        x_min = min(0, float(top_n["區間報酬率%"].min()))
+        x_max = max(0, float(top_n["區間報酬率%"].max()))
+        span = max(x_max - x_min, 1)
+        ax.set_xlim(x_min - span * 0.08, x_max + span * 0.18)
+
         for bar, (_, row) in zip(bars, top_n.iterrows()):
             width  = bar.get_width()
             align  = 'left'  if width >= 0 else 'right'
-            offset = 0.5     if width >= 0 else -0.5
+            offset = span * 0.01 if width >= 0 else -span * 0.01
             label  = f"{width:+.1f}%"
             if row["實際資料起點"] > global_baseline:
                 label += " *"
