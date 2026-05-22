@@ -53,43 +53,48 @@ def get_finmind_price(ticker, start_date, end_date):
 # ==========================================
 # 3. 核心大數據預載機制 (動態快取 + 防封鎖延遲)
 # ==========================================
-@st.cache_data(show_spinner=True) # 開啟 spinner 讓你知道它還在跑
+@st.cache_data(show_spinner=True)
 def load_master_market_data(tickers, preload_start, preload_end):
     yf_tickers = [t for t in tickers if ".TW" in t or ".TWO" in t]
     other_tickers = [t for t in tickers if t not in yf_tickers]
     
     master_df = pd.DataFrame()
     
-    # 1. yfinance 分批下載機制 (Chunking)
-    if yf_tickers:
-        chunk_size = 50  # 每 50 檔為一個批次
-        for i in range(0, len(yf_tickers), chunk_size):
-            chunk = yf_tickers[i : i + chunk_size]
-            try:
-                # 抓取當前批次
-                yf_data = yf.download(chunk, start=preload_start, end=preload_end, progress=False)
-                
-                # 處理欄位合併
-                if not yf_data.empty:
-                    if isinstance(yf_data.columns, pd.MultiIndex):
-                        price_col = 'Adj Close' if 'Adj Close' in yf_data.columns.levels[0] else 'Close'
-                        temp_df = yf_data[price_col].copy()
-                    else:
-                        temp_df = yf_data['Close'].to_frame()
-                        temp_df.columns = chunk # 單一標的時修正欄位名
-                        
-                    if master_df.empty:
-                        master_df = temp_df
-                    else:
-                        master_df = master_df.join(temp_df, how='outer')
-                        
-                # 【防封鎖關鍵】：每個批次抓完後，強制暫停 3 秒
-                time.sleep(3) 
-                
-            except Exception as e:
-                st.error(f"yfinance 批次 {i} 下載失敗: {e}")
+    # 建立一個帶有瀏覽器偽裝的 Session
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    })
+    
+    # 1. 放棄批量，改為單檔逐一下載 (最安全)
+    for ticker in yf_tickers:
+        try:
+            # 傳入偽裝的 session，並關閉 progress bar
+            yf_data = yf.download(ticker, start=preload_start, end=preload_end, progress=False, session=session)
             
-    # 2. FinMind 逐筆下載與禮貌性延遲
+            if not yf_data.empty:
+                # 處理欄位
+                if isinstance(yf_data.columns, pd.MultiIndex):
+                    price_col = 'Adj Close' if 'Adj Close' in yf_data.columns.levels[0] else 'Close'
+                    temp_df = yf_data[price_col].copy()
+                else:
+                    temp_df = yf_data['Close'].to_frame()
+                    
+                temp_df.columns = [ticker] # 強制重新命名欄位為股票代號
+                    
+                if master_df.empty:
+                    master_df = temp_df
+                else:
+                    master_df = master_df.join(temp_df, how='outer')
+                    
+            # 雲端環境建議每抓一檔休息 0.5 到 1 秒
+            time.sleep(0.5) 
+            
+        except Exception as e:
+            # 靜默處理單檔失敗，不影響全局
+            pass
+            
+    # 2. FinMind 逐筆下載
     for ticker in other_tickers:
         fm_df = get_finmind_price(ticker, preload_start, preload_end)
         if not fm_df.empty:
@@ -98,7 +103,6 @@ def load_master_market_data(tickers, preload_start, preload_end):
             else:
                 master_df = master_df.join(fm_df, how='outer')
         
-        # 【防封鎖關鍵】：FinMind 每抓一筆，強制暫停 1 秒
         time.sleep(1)
                 
     if not master_df.empty:
