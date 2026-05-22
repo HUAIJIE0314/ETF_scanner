@@ -23,6 +23,7 @@ REQUEST_HEADERS = {
 FINMIND_WORKERS = 4
 ENABLE_SLOW_TWSE_FALLBACK = False
 TWSE_FALLBACK_WORKERS = 4
+TWSE_MARKET_WORKERS = 8
 
 # ==========================================
 # 1. 初始化與中文字型設定
@@ -194,11 +195,106 @@ def _fetch_finmind_price_uncached(stock_id: str, start_date: str, end_date: str)
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def finmind_is_available(start_date: str, end_date: str) -> bool:
+    """Avoid spending hundreds of requests after FinMind has already rate-limited us."""
+    try:
+        r = requests.get(
+            "https://api.finmindtrade.com/api/v4/data",
+            params={
+                "dataset": "TaiwanStockPrice",
+                "data_id": "0050",
+                "start_date": start_date,
+                "end_date": end_date,
+                **({"token": FINMIND_TOKEN} if FINMIND_TOKEN else {}),
+            },
+            headers=REQUEST_HEADERS,
+            timeout=8,
+        )
+        data = r.json()
+        return r.status_code == 200 and data.get("msg") == "success" and bool(data.get("data"))
+    except Exception:
+        return False
+
+
 def _fetch_fallback_price(ticker: str, start_date: str, end_date: str, use_twse: bool = False) -> pd.DataFrame:
     price_df = _fetch_finmind_price_uncached(ticker, start_date, end_date)
     if price_df.empty and use_twse:
         price_df = fetch_twse_price(ticker, start_date, end_date)
     return price_df
+
+
+def _fetch_twse_market_day(day: pd.Timestamp, wanted_tickers: set) -> dict:
+    date_str = day.strftime("%Y%m%d")
+    try:
+        r = requests.get(
+            "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+            params={"date": date_str, "type": "ALLBUT0999", "response": "json"},
+            headers=REQUEST_HEADERS,
+            timeout=12,
+        )
+        data = r.json()
+        if data.get("stat") not in (None, "OK"):
+            return {}
+
+        for table in data.get("tables", []):
+            fields = table.get("fields", [])
+            if "證券代號" not in fields or "收盤價" not in fields:
+                continue
+
+            code_idx = fields.index("證券代號")
+            close_idx = fields.index("收盤價")
+            prices = {}
+            for row in table.get("data", []):
+                if len(row) <= max(code_idx, close_idx):
+                    continue
+                ticker = str(row[code_idx]).strip()
+                if ticker not in wanted_tickers:
+                    continue
+                close_text = str(row[close_idx]).replace(",", "").strip()
+                close = pd.to_numeric(close_text, errors="coerce")
+                if pd.notna(close):
+                    prices[ticker] = float(close)
+            return prices
+    except Exception:
+        return {}
+
+    return {}
+
+
+def fetch_twse_market_prices(tickers, start_date: str, end_date: str, progress_bar=None) -> pd.DataFrame:
+    """Fetch TWSE daily all-market closes and pivot only the requested ETF/ETN tickers."""
+    wanted_tickers = set(tickers)
+    days = pd.date_range(start_date, end_date, freq="B")
+    if days.empty:
+        return pd.DataFrame()
+
+    rows = []
+    done_count = 0
+    total_days = len(days)
+
+    with ThreadPoolExecutor(max_workers=TWSE_MARKET_WORKERS) as executor:
+        futures = {
+            executor.submit(_fetch_twse_market_day, day, wanted_tickers): day
+            for day in days
+        }
+        for future in as_completed(futures):
+            day = futures[future]
+            done_count += 1
+            if progress_bar is not None:
+                progress_bar.progress(
+                    int(done_count / total_days * 100),
+                    text=f"🔁 TWSE 全市場備援 {done_count}/{total_days}: {day.strftime('%Y-%m-%d')}"
+                )
+
+            prices = future.result()
+            if prices:
+                rows.append(pd.Series(prices, name=day))
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_index()
 
 
 # ==========================================
@@ -408,57 +504,80 @@ def load_master_market_data(tickers, preload_start, preload_end):
     
     fallback_tickers = [t for t in tickers if t in unresolved_tickers]
     if fallback_tickers:
-        fallback_bar = st.progress(0, text="🔁 Yahoo 未取得者，並行改用 FinMind 備援...")
-        total_fallback = len(fallback_tickers)
-        done_count = 0
+        fallback_bar = st.progress(0, text="🔁 Yahoo 未取得者，檢查 FinMind 備援...")
 
-        with ThreadPoolExecutor(max_workers=FINMIND_WORKERS) as executor:
-            futures = {
-                executor.submit(_fetch_fallback_price, ticker, preload_start, preload_end, False): ticker
-                for ticker in fallback_tickers
-            }
-            for future in as_completed(futures):
-                ticker = futures[future]
-                done_count += 1
-                fallback_bar.progress(
-                    int(done_count / total_fallback * 100),
-                    text=f"🔁 FinMind 備援 {done_count}/{total_fallback}: {ticker}"
-                )
+        if finmind_is_available(preload_start, preload_end):
+            total_fallback = len(fallback_tickers)
+            done_count = 0
 
-                price_df = future.result()
-                if price_df is not None and not price_df.empty and ticker in price_df.columns:
-                    series = price_df[ticker].dropna()
-                else:
-                    series = pd.Series(dtype="float64")
-                if not series.empty:
-                    price_series[ticker] = series
-                    unresolved_tickers.discard(ticker)
+            with ThreadPoolExecutor(max_workers=FINMIND_WORKERS) as executor:
+                futures = {
+                    executor.submit(_fetch_fallback_price, ticker, preload_start, preload_end, False): ticker
+                    for ticker in fallback_tickers
+                }
+                for future in as_completed(futures):
+                    ticker = futures[future]
+                    done_count += 1
+                    fallback_bar.progress(
+                        int(done_count / total_fallback * 100),
+                        text=f"🔁 FinMind 備援 {done_count}/{total_fallback}: {ticker}"
+                    )
+
+                    price_df = future.result()
+                    if price_df is not None and not price_df.empty and ticker in price_df.columns:
+                        series = price_df[ticker].dropna()
+                    else:
+                        series = pd.Series(dtype="float64")
+                    if not series.empty:
+                        price_series[ticker] = series
+                        unresolved_tickers.discard(ticker)
+        else:
+            st.info("ℹ️ FinMind 目前不可用或已達請求上限，改用 TWSE 全市場資料備援。")
 
         twse_tickers = [t for t in fallback_tickers if t in unresolved_tickers]
-        if twse_tickers and not ENABLE_SLOW_TWSE_FALLBACK:
-            st.info(
-                f"⏩ 已跳過 {len(twse_tickers)} 檔慢速 TWSE 月資料備援。"
-                "若要最大化資料完整度，可在程式中將 ENABLE_SLOW_TWSE_FALLBACK 改為 True。"
-            )
-        elif twse_tickers:
+        if twse_tickers:
             fallback_bar.progress(
                 0,
-                text=f"🔁 FinMind 仍無資料的 {len(twse_tickers)} 檔，改用 TWSE 官方資料..."
+                text=f"🔁 改用 TWSE 全市場日資料補 {len(twse_tickers)} 檔..."
             )
-            total_twse = len(twse_tickers)
+            twse_market_df = fetch_twse_market_prices(
+                twse_tickers,
+                preload_start,
+                preload_end,
+                progress_bar=fallback_bar,
+            )
+            if not twse_market_df.empty:
+                for ticker in twse_market_df.columns:
+                    series = twse_market_df[ticker].dropna()
+                    if not series.empty:
+                        price_series[ticker] = series
+                        unresolved_tickers.discard(ticker)
+
+        slow_twse_tickers = [t for t in fallback_tickers if t in unresolved_tickers]
+        if slow_twse_tickers and not ENABLE_SLOW_TWSE_FALLBACK:
+            st.info(
+                f"⏩ 已跳過 {len(slow_twse_tickers)} 檔慢速逐檔 TWSE 月資料備援。"
+                "若要最大化資料完整度，可在程式中將 ENABLE_SLOW_TWSE_FALLBACK 改為 True。"
+            )
+        elif slow_twse_tickers:
+            fallback_bar.progress(
+                0,
+                text=f"🔁 TWSE 全市場仍無資料的 {len(slow_twse_tickers)} 檔，改用慢速逐檔月資料..."
+            )
+            total_twse = len(slow_twse_tickers)
             done_count = 0
 
             with ThreadPoolExecutor(max_workers=TWSE_FALLBACK_WORKERS) as executor:
                 futures = {
                     executor.submit(fetch_twse_price, ticker, preload_start, preload_end): ticker
-                    for ticker in twse_tickers
+                    for ticker in slow_twse_tickers
                 }
                 for future in as_completed(futures):
                     ticker = futures[future]
                     done_count += 1
                     fallback_bar.progress(
                         int(done_count / total_twse * 100),
-                        text=f"🔁 TWSE 備援 {done_count}/{total_twse}: {ticker}"
+                        text=f"🔁 慢速 TWSE 備援 {done_count}/{total_twse}: {ticker}"
                     )
 
                     price_df = future.result()
