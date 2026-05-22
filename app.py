@@ -606,7 +606,7 @@ def load_master_market_data(tickers, preload_start, preload_end):
 
     if not master_df.empty:
         master_df.index = pd.to_datetime(master_df.index)
-        master_df = master_df.sort_index().ffill().bfill()
+        master_df = master_df.sort_index()
 
     return master_df
 
@@ -678,35 +678,15 @@ if st.sidebar.button("🔄 重新下載最新數據"):
 sliced_df = master_data.loc[start_pick:end_pick]
 
 
-def clean_price_series(series: pd.Series) -> pd.Series:
-    """Remove obvious bad ticks that would create fake -100% drawdowns."""
+def prepare_return_series(series: pd.Series) -> pd.Series:
+    """Use only real positive prices; do not smooth, backfill, or remove middle ticks."""
     series = pd.to_numeric(series, errors="coerce").dropna()
-    series = series[series > 0]
-    if len(series) < 3:
-        return series
-
-    cleaned = series.copy()
-    for i in range(1, len(series) - 1):
-        prev_price = float(series.iloc[i - 1])
-        cur_price = float(series.iloc[i])
-        next_price = float(series.iloc[i + 1])
-        if prev_price <= 0 or cur_price <= 0 or next_price <= 0:
-            continue
-
-        drop_from_prev = cur_price / prev_price - 1
-        rebound_to_next = next_price / cur_price - 1
-        next_near_prev = abs(next_price / prev_price - 1) <= 0.25
-
-        if drop_from_prev <= -0.70 and rebound_to_next >= 1.50 and next_near_prev:
-            cleaned.iloc[i] = np.nan
-
-    return cleaned.dropna()
+    return series[series > 0]
 
 
 analysis_results = []
 for ticker in sliced_df.columns:
-    raw_series = sliced_df[ticker].dropna()
-    series = clean_price_series(raw_series)
+    series = prepare_return_series(sliced_df[ticker])
     if len(series) < 2:
         continue
 
@@ -730,7 +710,6 @@ for ticker in sliced_df.columns:
         "終點價格":       round(p_end,   2),
         "區間報酬率%":    round(return_pct, 2),
         "最大回撤(MDD)%": round(mdd_pct, 2),
-        "清洗筆數":       len(raw_series) - len(series),
     })
 
 df_res = pd.DataFrame(analysis_results)
@@ -761,7 +740,7 @@ if not df_res.empty:
         )
         st.caption(
             f"💡 若標的之『實際資料起點』晚於基準日 `{global_baseline}`，"
-            "代表該商品於此區間中途才上市或取得資料。清洗筆數為自動排除的非正價格或疑似單日錯價。"
+            "代表該商品於此區間中途才上市或取得資料。報酬率使用區間內第一筆與最後一筆有效價格計算。"
         )
 
     with col2:
