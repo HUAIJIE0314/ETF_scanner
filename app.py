@@ -757,7 +757,7 @@ if not df_res.empty:
                 subset=["區間報酬率%"], cmap="RdYlGn", vmin=-30, vmax=30
             ),
             use_container_width=True,
-            height=450,
+            height=720,
         )
         st.caption(
             f"💡 若標的之『實際資料起點』晚於基準日 `{global_baseline}`，"
@@ -767,9 +767,9 @@ if not df_res.empty:
     with col2:
         st.subheader("📈 頂尖績效標的比較圖")
 
-        top_n = df_res.head(10).sort_values(by="區間報酬率%", ascending=True)
+        top_n = df_res.head(30).sort_values(by="區間報酬率%", ascending=True)
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(10, 12))
 
         plot_colors = []
         for _, row in top_n.iterrows():
