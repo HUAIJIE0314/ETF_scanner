@@ -232,60 +232,63 @@ def get_all_etf_tickers():
 #    注意：進度條不能放在 @st.cache_data 函式內，
 #    改用 st.session_state 避免重複下載。
 # ==========================================
+@st.cache_data(show_spinner=False)
+def _batch_download(tickers_tw, start, end):
+    """一次下載所有 .TW 代號"""
+    symbols = [f"{t}.TW" for t in tickers_tw]
+    raw = yf.download(symbols, start=start, end=end, 
+                      progress=False, auto_adjust=True, 
+                      group_by='ticker')
+    return raw
+
 def load_master_market_data(tickers, preload_start, preload_end):
-    """
-    首次執行：顯示進度條並逐一下載。
-    之後互動（調滑桿等）：直接從 session_state 取，不重新下載。
-    """
-    total = len(tickers)
     master_df = pd.DataFrame()
     failed_tickers = []
+    
+    BATCH_SIZE = 50  # 每批 50 檔
+    batches = [tickers[i:i+BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
+    my_bar = st.progress(0, text="📥 批次下載中...")
 
-    my_bar = st.progress(0, text="📥 啟動三引擎資料下載中...")
-
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    })
-
-    for i, ticker in enumerate(tickers):
+    for b_idx, batch in enumerate(batches):
         my_bar.progress(
-            int(((i + 1) / total) * 100),
-            text=f"📥 下載中: {ticker} ({i+1}/{total})"
+            int((b_idx + 1) / len(batches) * 100),
+            text=f"📥 下載第 {b_idx+1}/{len(batches)} 批（共 {len(batch)} 檔）"
         )
-        temp_df = pd.DataFrame()
-
-        # 引擎 1：Yahoo Finance (.TW 上市)
-        temp_df = fetch_yf_price(f"{ticker}.TW", preload_start, preload_end, session)
-        if not temp_df.empty:
-            temp_df.columns = [ticker]
-
-        # 引擎 2：Yahoo Finance (.TWO 上櫃)
-        if temp_df.empty:
-            temp_df = fetch_yf_price(f"{ticker}.TWO", preload_start, preload_end, session)
-            if not temp_df.empty:
-                temp_df.columns = [ticker]
-
-        # 引擎 3：TWSE 官方 API（去掉後綴字母再查）
-        if temp_df.empty:
-            base_id = ticker.rstrip('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')
-            twse_df = fetch_twse_price(base_id, preload_start, preload_end)
-            if not twse_df.empty:
-                twse_df.columns = [ticker]
-                temp_df = twse_df
-
-        # 合併至主表
-        if not temp_df.empty:
-            master_df = temp_df if master_df.empty else master_df.join(temp_df, how='outer')
-        else:
-            failed_tickers.append(ticker)
-
-        time.sleep(0.15)
-
+        
+        # 同時嘗試 .TW 和 .TWO
+        symbols_tw  = [f"{t}.TW"  for t in batch]
+        symbols_two = [f"{t}.TWO" for t in batch]
+        
+        for symbols in [symbols_tw, symbols_two]:
+            try:
+                raw = yf.download(
+                    symbols, start=preload_start, end=preload_end,
+                    progress=False, auto_adjust=True, group_by='ticker',
+                    timeout=10  # 整批只等 10 秒
+                )
+                if raw.empty:
+                    continue
+                    
+                # 從批次結果裡逐一取出各代號的 Close
+                for sym in symbols:
+                    ticker = sym.replace('.TW', '').replace('.TWO', '')
+                    if ticker in master_df.columns:
+                        continue  # 已有資料就跳過
+                    try:
+                        if isinstance(raw.columns, pd.MultiIndex):
+                            series = raw['Close'][sym].dropna()
+                        else:
+                            series = raw['Close'].dropna()
+                        
+                        if not series.empty:
+                            master_df[ticker] = series
+                        else:
+                            failed_tickers.append(ticker)
+                    except Exception:
+                        failed_tickers.append(ticker)
+            except Exception:
+                pass
+    
     my_bar.empty()
 
     if failed_tickers:
