@@ -642,16 +642,29 @@ st.sidebar.header("🎛️ 即時動態篩選面板")
 min_date = master_data.index.min().date()
 max_date = master_data.index.max().date()
 
-time_range = st.sidebar.slider(
-    "調整回測時間軸 (即時運算)",
+default_start = min(max(date(2025, 1, 1), min_date), max_date)
+st.sidebar.markdown("#### 回測區間")
+start_input = st.sidebar.date_input(
+    "開始日期",
+    value=default_start,
     min_value=min_date,
     max_value=max_date,
-    value=(date(2025, 1, 1), max_date),
-    format="YYYY-MM-DD"
+    format="YYYY/MM/DD",
+)
+end_input = st.sidebar.date_input(
+    "結束日期",
+    value=max_date,
+    min_value=min_date,
+    max_value=max_date,
+    format="YYYY/MM/DD",
 )
 
-start_pick = pd.to_datetime(time_range[0])
-end_pick   = pd.to_datetime(time_range[1])
+if start_input > end_input:
+    st.sidebar.error("開始日期不可晚於結束日期")
+    st.stop()
+
+start_pick = pd.to_datetime(start_input)
+end_pick   = pd.to_datetime(end_input)
 
 sort_by = st.sidebar.selectbox(
     "關鍵潛力指標排序基準",
@@ -670,9 +683,36 @@ if st.sidebar.button("🔄 重新下載最新數據"):
 # ==========================================
 sliced_df = master_data.loc[start_pick:end_pick]
 
+
+def clean_price_series(series: pd.Series) -> pd.Series:
+    """Remove obvious bad ticks that would create fake -100% drawdowns."""
+    series = pd.to_numeric(series, errors="coerce").dropna()
+    series = series[series > 0]
+    if len(series) < 3:
+        return series
+
+    cleaned = series.copy()
+    for i in range(1, len(series) - 1):
+        prev_price = float(series.iloc[i - 1])
+        cur_price = float(series.iloc[i])
+        next_price = float(series.iloc[i + 1])
+        if prev_price <= 0 or cur_price <= 0 or next_price <= 0:
+            continue
+
+        drop_from_prev = cur_price / prev_price - 1
+        rebound_to_next = next_price / cur_price - 1
+        next_near_prev = abs(next_price / prev_price - 1) <= 0.25
+
+        if drop_from_prev <= -0.70 and rebound_to_next >= 1.50 and next_near_prev:
+            cleaned.iloc[i] = np.nan
+
+    return cleaned.dropna()
+
+
 analysis_results = []
 for ticker in sliced_df.columns:
-    series = sliced_df[ticker].dropna()
+    raw_series = sliced_df[ticker].dropna()
+    series = clean_price_series(raw_series)
     if len(series) < 2:
         continue
 
@@ -696,6 +736,7 @@ for ticker in sliced_df.columns:
         "終點價格":       round(p_end,   2),
         "區間報酬率%":    round(return_pct, 2),
         "最大回撤(MDD)%": round(mdd_pct, 2),
+        "清洗筆數":       len(raw_series) - len(series),
     })
 
 df_res = pd.DataFrame(analysis_results)
@@ -727,7 +768,7 @@ if not df_res.empty:
         )
         st.caption(
             f"💡 若標的之『實際資料起點』晚於基準日 `{global_baseline}`，"
-            "代表該商品於此區間中途才上市或取得資料。"
+            "代表該商品於此區間中途才上市或取得資料。清洗筆數為自動排除的非正價格或疑似單日錯價。"
         )
 
     with col2:
