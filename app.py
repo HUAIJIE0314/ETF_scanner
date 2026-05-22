@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import os
 from datetime import datetime, date
+import time
 
 # ==========================================
 # 1. 初始化與中文字型設定
@@ -50,29 +51,45 @@ def get_finmind_price(ticker, start_date, end_date):
     return pd.DataFrame()
 
 # ==========================================
-# 3. 核心大數據預載機制 (動態快取)
+# 3. 核心大數據預載機制 (動態快取 + 防封鎖延遲)
 # ==========================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=True) # 開啟 spinner 讓你知道它還在跑
 def load_master_market_data(tickers, preload_start, preload_end):
-    """一口氣抓取寬幅時間數據，存在記憶體供滑桿切片"""
     yf_tickers = [t for t in tickers if ".TW" in t or ".TWO" in t]
     other_tickers = [t for t in tickers if t not in yf_tickers]
     
     master_df = pd.DataFrame()
     
-    # 1. 批量快抓 yfinance 支援的群組
+    # 1. yfinance 分批下載機制 (Chunking)
     if yf_tickers:
-        try:
-            yf_data = yf.download(yf_tickers, start=preload_start, end=preload_end, progress=False)
-            if isinstance(yf_data.columns, pd.MultiIndex):
-                price_col = 'Adj Close' if 'Adj Close' in yf_data.columns.levels[0] else 'Close'
-                master_df = yf_data[price_col].copy()
-            else:
-                master_df = yf_data['Close'].to_frame()
-        except Exception as e:
-            st.error(f"yfinance 批量下載失敗: {e}")
+        chunk_size = 50  # 每 50 檔為一個批次
+        for i in range(0, len(yf_tickers), chunk_size):
+            chunk = yf_tickers[i : i + chunk_size]
+            try:
+                # 抓取當前批次
+                yf_data = yf.download(chunk, start=preload_start, end=preload_end, progress=False)
+                
+                # 處理欄位合併
+                if not yf_data.empty:
+                    if isinstance(yf_data.columns, pd.MultiIndex):
+                        price_col = 'Adj Close' if 'Adj Close' in yf_data.columns.levels[0] else 'Close'
+                        temp_df = yf_data[price_col].copy()
+                    else:
+                        temp_df = yf_data['Close'].to_frame()
+                        temp_df.columns = chunk # 單一標的時修正欄位名
+                        
+                    if master_df.empty:
+                        master_df = temp_df
+                    else:
+                        master_df = master_df.join(temp_df, how='outer')
+                        
+                # 【防封鎖關鍵】：每個批次抓完後，強制暫停 3 秒
+                time.sleep(3) 
+                
+            except Exception as e:
+                st.error(f"yfinance 批次 {i} 下載失敗: {e}")
             
-    # 2. 單獨補網抓取特殊商品 (如 02001L)
+    # 2. FinMind 逐筆下載與禮貌性延遲
     for ticker in other_tickers:
         fm_df = get_finmind_price(ticker, preload_start, preload_end)
         if not fm_df.empty:
@@ -80,6 +97,9 @@ def load_master_market_data(tickers, preload_start, preload_end):
                 master_df = fm_df
             else:
                 master_df = master_df.join(fm_df, how='outer')
+        
+        # 【防封鎖關鍵】：FinMind 每抓一筆，強制暫停 1 秒
+        time.sleep(1)
                 
     if not master_df.empty:
         master_df.index = pd.to_datetime(master_df.index)
@@ -196,7 +216,8 @@ if not df_res.empty:
                 "區間報酬率%": "{:+.2f}%",
                 "最大回撤(MDD)%": "{:.2f}%"
             }).background_gradient(subset=["區間報酬率%"], cmap="RdYlGn", vmin=-30, vmax=30),
-            use_container_width=True,
+            # use_container_width=True,
+            width='stretch',
             height=450
         )
         st.caption(f"💡 註：若標的之『實際資料起點』晚於基準日 `{global_baseline}`，代表該商品於此區間中途才上市或取得資料。")
