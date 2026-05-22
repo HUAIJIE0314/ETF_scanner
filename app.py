@@ -19,15 +19,13 @@ st.title("🔍 全市場 ETF / ETN 潛力即時強弱勢掃描器")
 def load_font():
     font_path = 'NotoSansTC-Regular.ttf'
     if os.path.exists(font_path):
-        # 關鍵：強制將字型加入 matplotlib 的字型庫中
         fm.fontManager.addfont(font_path)
         prop = fm.FontProperties(fname=font_path)
-        return prop.get_name() # 回傳註冊後的正式名稱
+        return prop.get_name()
     return None
 
 font_name = load_font()
 if font_name:
-    # 系統成功註冊後，再套用全域設定
     plt.rcParams['font.sans-serif'] = [font_name]
     plt.rcParams['axes.unicode_minus'] = False
 else:
@@ -35,162 +33,270 @@ else:
 
 
 # ==========================================
-# 2. 資料源驅動：FinMind 單獨補網功能
+# 2. 【修正】yfinance 正確取價函式
+#    新版 yfinance (1.0+) 一律回傳 MultiIndex，
+#    必須用 (metric, ticker) 兩層結構正確切片。
 # ==========================================
-def get_finmind_price(ticker, start_date, end_date):
+def fetch_yf_price(ticker_with_suffix, start, end, session=None):
+    """
+    回傳單欄 DataFrame，欄名為 ticker_with_suffix。
+    失敗時回傳空 DataFrame。
+    """
+    try:
+        kwargs = dict(start=start, end=end, progress=False, auto_adjust=True)
+        if session:
+            kwargs['session'] = session
+
+        raw = yf.download(ticker_with_suffix, **kwargs)
+
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+
+        # 新版：MultiIndex 欄位結構為 (metric, symbol)
+        if isinstance(raw.columns, pd.MultiIndex):
+            # 優先取 Close（auto_adjust=True 時 Close 即已還權）
+            if 'Close' in raw.columns.get_level_values(0):
+                series = raw['Close'].iloc[:, 0]
+            elif 'Adj Close' in raw.columns.get_level_values(0):
+                series = raw['Adj Close'].iloc[:, 0]
+            else:
+                return pd.DataFrame()
+        else:
+            # 舊版或單層欄位
+            if 'Close' in raw.columns:
+                series = raw['Close']
+            elif 'Adj Close' in raw.columns:
+                series = raw['Adj Close']
+            else:
+                return pd.DataFrame()
+
+        df = series.to_frame(name=ticker_with_suffix)
+        df = df[~df.index.duplicated(keep='last')]
+        return df
+
+    except Exception:
+        return pd.DataFrame()
+
+
+# ==========================================
+# 3. 【新增】TWSE 官方開放 API 備援
+#    完全免費、無流量限制，專治 Yahoo 查無的台股 ETF。
+#    來源：https://openapi.twse.com.tw
+# ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_twse_price(stock_id: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    透過 TWSE 開放 API 取得上市股票月成交資訊。
+    stock_id: 純數字代號，例如 "0050"
+    回傳單欄 DataFrame，欄名為 stock_id，index 為日期。
+    """
+    all_rows = []
+
+    try:
+        # 逐月查詢
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt   = datetime.strptime(end_date,   "%Y-%m-%d")
+
+        cur = start_dt.replace(day=1)
+        while cur <= end_dt:
+            date_str = cur.strftime("%Y%m%d")  # e.g. 20230101
+            url = (
+                f"https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+                f"?response=json&date={date_str}&stockNo={stock_id}"
+            )
+            try:
+                r = requests.get(url, timeout=10)
+                data = r.json()
+                if data.get("stat") == "OK":
+                    for row in data.get("data", []):
+                        # row[0] = 日期 (民國), row[6] = 收盤價
+                        try:
+                            roc_date = row[0].strip()   # e.g. "112/01/03"
+                            parts = roc_date.split("/")
+                            ad_year = int(parts[0]) + 1911
+                            dt = datetime(ad_year, int(parts[1]), int(parts[2]))
+                            close_str = row[6].replace(",", "").strip()
+                            close = float(close_str)
+                            all_rows.append({"date": dt, "close": close})
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            # 下個月
+            if cur.month == 12:
+                cur = cur.replace(year=cur.year + 1, month=1)
+            else:
+                cur = cur.replace(month=cur.month + 1)
+
+            time.sleep(0.3)  # 對 TWSE 友善
+
+    except Exception:
+        return pd.DataFrame()
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    df = df[~df.index.duplicated(keep='last')]
+    return df[["close"]].rename(columns={"close": stock_id})
+
+
+# ==========================================
+# 4. 【修正】代號清單：過濾非標準格式
+#    009xxx / 009xxxx 是指數，不是可交易 ETF。
+#    020xxx 是 ETN，部分格式在 Yahoo 上查無，先保留但會被備援接力。
+# ==========================================
+def is_valid_etf_ticker(ticker: str) -> bool:
+    """
+    只保留可在交易所實際掛牌買賣的 ETF/ETN 代號。
+    規則：
+      - 以 00 開頭（大部分 ETF）→ 保留
+      - 以 02 開頭，長度 6（ETN）→ 保留
+      - 其他（009xxx 指數代號、006xxx 部分）→ 視情況
+    排除：
+      - 含英文字母但不是結尾 L/R/B/K/U/C（這些是槓桿/反向/債券後綴）
+      - 純數字但以 009 或 008 開頭（交易所指數）
+    """
+    # 必須全數字或數字+結尾英文後綴
+    import re
+    if not re.match(r'^\d{4,6}[A-Z]?$', ticker):
+        return False
+    # 排除 009xxx / 008xxx（指數，非 ETF）
+    if ticker.startswith(('009', '008')):
+        return False
+    # 只保留 00xxxx 與 020xxx
+    if ticker.startswith('00') or ticker.startswith('02'):
+        return True
+    return False
+
+
+# ==========================================
+# 5. 動態取得全市場 ETF / ETN 代號清單
+# ==========================================
+@st.cache_data(show_spinner=False)
+def get_all_etf_tickers():
     url = "https://api.finmindtrade.com/api/v4/data"
-    parameter = {
-        "dataset": "TaiwanStockPrice",
-        "data_id": ticker.replace('.TW', '').replace('.TWO', ''),
-        "start_date": start_date,
-        "end_date": end_date,
-    }
+    parameter = {"dataset": "TaiwanStockInfo"}
     try:
         r = requests.get(url, params=parameter, timeout=10)
         data = r.json()
         if data.get('msg') == 'success' and len(data.get('data', [])) > 0:
             df = pd.DataFrame(data['data'])
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index('date', inplace=True)
-            return df[['close']].rename(columns={'close': ticker})
-    except:
-        pass
-    return pd.DataFrame()
+            etf_etn_df = df[df['stock_id'].str.startswith(('00', '02'))]
+            tickers = etf_etn_df['stock_id'].tolist()
+            # 【修正】過濾非標準代號
+            tickers = [t for t in set(tickers) if is_valid_etf_ticker(t)]
+            return sorted(tickers)
+    except Exception as e:
+        st.error(f"取得市場清單失敗: {e}")
+
+    return ["0050", "0056", "00631L", "00940"]
+
+
+with st.spinner("🔍 正在掃描台股全市場 ETF/ETN 代號清單..."):
+    TICKER_POOL = get_all_etf_tickers()
+
+st.info(f"✅ 系統已鎖定全市場共 {len(TICKER_POOL)} 檔 ETF/ETN（已過濾非交易代號），準備開始下載歷史數據...")
+
+PRELOAD_START = "2023-01-01"
+PRELOAD_END   = datetime.today().strftime("%Y-%m-%d")
+
 
 # ==========================================
-# 3. 核心大數據預載機制 (終極雙引擎：Yahoo 主力 + FinMind 備援)
+# 6. 【修正】核心資料下載：三引擎接力
+#    引擎 1：Yahoo (.TW)
+#    引擎 2：Yahoo (.TWO)（上櫃）
+#    引擎 3：TWSE 官方 API（完全免費備援，取代 FinMind）
 # ==========================================
 @st.cache_data(show_spinner=True)
 def load_master_market_data(tickers, preload_start, preload_end):
-    master_df = pd.DataFrame()
-    failed_tickers = [] # 用來收集失敗名單，避免黃字洗版
-    
-    progress_text = "📥 啟動雙引擎資料下載中 (Yahoo + FinMind)..."
-    my_bar = st.progress(0, text=progress_text)
-    
-    # 建立 Yahoo 專用的偽裝 Session
+    master_df   = pd.DataFrame()
+    failed_tickers = []
+
+    my_bar = st.progress(0, text="📥 啟動三引擎資料下載中...")
+
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
     })
-    
+
     for i, ticker in enumerate(tickers):
-        my_bar.progress(int(((i + 1) / len(tickers)) * 100), text=f"📥 正在下載: {ticker} ({i+1}/{len(tickers)})")
+        pct = int(((i + 1) / len(tickers)) * 100)
+        my_bar.progress(pct, text=f"📥 下載中: {ticker} ({i+1}/{len(tickers)})")
+
         temp_df = pd.DataFrame()
-        
-        # -----------------------------------------
-        # 引擎 1：Yahoo Finance (涵蓋率最廣，專治債券 ETF)
-        # -----------------------------------------
-        try:
-            # 先嘗試上市代號 (.TW)
-            yf_data = yf.download(f"{ticker}.TW", start=preload_start, end=preload_end, progress=False, session=session)
-            
-            # 如果空的，改嘗試上櫃代號 (.TWO)
-            if yf_data.empty:
-                yf_data = yf.download(f"{ticker}.TWO", start=preload_start, end=preload_end, progress=False, session=session)
-                
-            if not yf_data.empty:
-                # 處理欄位降維
-                if isinstance(yf_data.columns, pd.MultiIndex):
-                    price_col = 'Adj Close' if 'Adj Close' in yf_data.columns.levels[0] else 'Close'
-                    temp_df = yf_data[price_col].copy()
-                else:
-                    temp_df = yf_data['Close'].to_frame()
-                    
-                temp_df.columns = [ticker] # 統一欄位名稱為純代號
-        except:
-            pass
 
-        # -----------------------------------------
-        # 引擎 2：FinMind 救援 (專治 Yahoo 查無的 ETN，如 02001L)
-        # -----------------------------------------
+        # ── 引擎 1：Yahoo (.TW 上市) ──
         if temp_df.empty:
-            try:
-                fm_df = get_finmind_price(ticker, preload_start, preload_end)
-                if not fm_df.empty:
-                    temp_df = fm_df
-            except:
-                pass
+            temp_df = fetch_yf_price(f"{ticker}.TW", preload_start, preload_end, session)
+            if not temp_df.empty:
+                temp_df.columns = [ticker]
 
-        # -----------------------------------------
-        # 合併至主表
-        # -----------------------------------------
+        # ── 引擎 2：Yahoo (.TWO 上櫃) ──
+        if temp_df.empty:
+            temp_df = fetch_yf_price(f"{ticker}.TWO", preload_start, preload_end, session)
+            if not temp_df.empty:
+                temp_df.columns = [ticker]
+
+        # ── 引擎 3：TWSE 官方 API（免費，無流量限制）──
+        if temp_df.empty:
+            # 只取純數字部分（去掉 L/R/B 等後綴）送給 TWSE API
+            base_id = ticker.rstrip('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')
+            twse_df = fetch_twse_price(base_id, preload_start, preload_end)
+            if not twse_df.empty:
+                twse_df.columns = [ticker]
+                temp_df = twse_df
+
+        # ── 合併 ──
         if not temp_df.empty:
             if master_df.empty:
                 master_df = temp_df
             else:
                 master_df = master_df.join(temp_df, how='outer')
         else:
-            # 兩個引擎都找不到，才宣告失敗
-            failed_tickers.append(ticker) 
+            failed_tickers.append(ticker)
 
-        # 禮貌性延遲 0.2 秒 (因為分散了 API 壓力，可以稍微縮短延遲)
-        time.sleep(0.2)
-        
+        time.sleep(0.15)
+
     my_bar.empty()
-    
-    # 集中印出失敗名單，還給版面清爽
+
     if failed_tickers:
-        st.warning(f"⚠️ 以下 {len(failed_tickers)} 檔因資料源缺失、未上市或下市而無法取得：\n{', '.join(failed_tickers)}")
-                
+        st.warning(
+            f"⚠️ 以下 {len(failed_tickers)} 檔三引擎均無法取得資料"
+            f"（可能已下市、暫停交易或代號有誤）：\n"
+            + ", ".join(failed_tickers)
+        )
+
     if not master_df.empty:
         master_df.index = pd.to_datetime(master_df.index)
         master_df = master_df.sort_index().ffill().bfill()
-        
+
     return master_df
 
 
-# ==========================================
-# 4. 動態取得全市場 ETF / ETN 代號清單
-# ==========================================
-@st.cache_data(show_spinner=False)
-def get_all_etf_tickers():
-    url = "https://api.finmindtrade.com/api/v4/data"
-    parameter = {
-        "dataset": "TaiwanStockInfo"
-    }
-    try:
-        r = requests.get(url, params=parameter, timeout=10)
-        data = r.json()
-        if data.get('msg') == 'success' and len(data.get('data', [])) > 0:
-            df = pd.DataFrame(data['data'])
-            # 台股的 ETF 通常以 00 開頭，ETN 以 02 開頭
-            # 利用字串篩選把全市場符合條件的代號全部抓出來
-            etf_etn_df = df[df['stock_id'].str.startswith(('00', '02'))]
-            tickers = etf_etn_df['stock_id'].tolist()
-            return list(set(tickers)) # 用 set 確保沒有重複代號
-    except Exception as e:
-        st.error(f"取得市場清單失敗: {e}")
-        
-    # 萬一 API 掛掉的保底名單
-    return ["0050", "0056", "02001L", "00631L"]
-
-with st.spinner("🔍 正在掃描台股全市場 ETF/ETN 代號清單..."):
-    TICKER_POOL = get_all_etf_tickers()
-
-st.info(f"✅ 系統已鎖定全市場共 {len(TICKER_POOL)} 檔 ETF/ETN，準備開始下載歷史數據...")
-
-# 決定大視窗資料範圍（預載 2023 至今的所有數據）
-PRELOAD_START = "2023-01-01"
-PRELOAD_END = datetime.today().strftime("%Y-%m-%d")
-
-with st.spinner("📥 正在初始化全市場歷史數據快取（這大約需要 3~5 分鐘，請耐心等候）..."):
+with st.spinner("📥 正在初始化全市場歷史數據快取（首次約需 3~5 分鐘）..."):
     master_data = load_master_market_data(TICKER_POOL, PRELOAD_START, PRELOAD_END)
 
 if master_data.empty:
     st.error("無法載入基礎市場數據，請檢查網路連線。")
     st.stop()
 
+
 # ==========================================
-# 5. 側邊欄：即時連動控制面板
+# 7. 側邊欄：即時連動控制面板
 # ==========================================
 st.sidebar.header("🎛️ 即時動態篩選面板")
 
-# 讓時間軸滑桿動態讀取 Master Data 的最小與最大實體日期
 min_date = master_data.index.min().date()
 max_date = master_data.index.max().date()
 
-# 核心：動態雙向時間軸滑桿
 time_range = st.sidebar.slider(
     "調整回測時間軸 (即時運算)",
     min_value=min_date,
@@ -201,17 +307,16 @@ time_range = st.sidebar.slider(
 
 start_pick, end_pick = pd.to_datetime(time_range[0]), pd.to_datetime(time_range[1])
 
-# 排序欄位首選
 sort_by = st.sidebar.selectbox(
     "關鍵潛力指標排序基準",
     options=["區間報酬率%", "最大回撤(MDD)%", "最後收盤價"],
     index=0
 )
 
+
 # ==========================================
-# 6. 秒級記憶體運算核心
+# 8. 秒級記憶體運算核心
 # ==========================================
-# 直接從記憶體中的 DataFrame 切片
 sliced_df = master_data.loc[start_pick:end_pick]
 
 analysis_results = []
@@ -219,102 +324,102 @@ for ticker in sliced_df.columns:
     series = sliced_df[ticker].dropna()
     if len(series) < 2:
         continue
-        
+
     p_start = float(series.iloc[0])
-    p_end = float(series.iloc[-1])
-    
-    # 【新增這兩行】：防止價格為 0 導致系統崩潰
+    p_end   = float(series.iloc[-1])
+
     if p_start == 0 or pd.isna(p_start):
         continue
-        
-    # 1. 計算區間報酬率
+
     return_pct = ((p_end - p_start) / p_start) * 100
-    
-    # 2. 計算最大回撤 (MDD) - 風險控制的核心指標
-    cum_max = series.cummax()
+
+    cum_max  = series.cummax()
     drawdown = (series - cum_max) / cum_max * 100
-    mdd_pct = drawdown.min()
-    
+    mdd_pct  = drawdown.min()
+
     analysis_results.append({
-        "股票代號": ticker,
-        "實際資料起點": series.index[0].strftime("%Y-%m-%d"),
-        "實際資料終點": series.index[-1].strftime("%Y-%m-%d"),
-        "起點價格": round(p_start, 2),
-        "終點價格": round(p_end, 2),
-        "區間報酬率%": round(return_pct, 2),
-        "最大回撤(MDD)%": round(mdd_pct, 2)
+        "股票代號":         ticker,
+        "實際資料起點":    series.index[0].strftime("%Y-%m-%d"),
+        "實際資料終點":    series.index[-1].strftime("%Y-%m-%d"),
+        "起點價格":        round(p_start, 2),
+        "終點價格":        round(p_end,   2),
+        "區間報酬率%":     round(return_pct, 2),
+        "最大回撤(MDD)%":  round(mdd_pct, 2),
     })
 
 df_res = pd.DataFrame(analysis_results)
 
-# 依使用者選定指標進行即時排序
 if not df_res.empty:
-    if sort_by == "最大回撤(MDD)%":
-        # 回撤越少越好（負數越大越好），由大到小排
-        df_res = df_res.sort_values(by=sort_by, ascending=False).reset_index(drop=True)
-    else:
-        # 報酬率由高到低排
-        df_res = df_res.sort_values(by=sort_by, ascending=False).reset_index(drop=True)
+    ascending = sort_by == "最大回撤(MDD)%"  # MDD 越接近 0 越好
+    df_res = df_res.sort_values(by=sort_by, ascending=ascending).reset_index(drop=True)
 
-    # 找出大部隊基準日
     global_baseline = df_res["實際資料起點"].min()
 
     # ==========================================
-    # 7. 前端即時視覺化呈現
+    # 9. 前端即時視覺化呈現
     # ==========================================
     col1, col2 = st.columns([1, 1])
 
     with col1:
         st.subheader(f"📊 潛力排行榜 (依 {sort_by} 排序)")
+
+        # 【修正】width='stretch' 在新版 Streamlit 已棄用，改用 use_container_width=True
         st.dataframe(
             df_res.style.format({
-                "起點價格": "{:.2f}",
-                "終點價格": "{:.2f}",
-                "區間報酬率%": "{:+.2f}%",
-                "最大回撤(MDD)%": "{:.2f}%"
-            }).background_gradient(subset=["區間報酬率%"], cmap="RdYlGn", vmin=-30, vmax=30),
-            # use_container_width=True,
-            width='stretch',
-            height=450
+                "起點價格":       "{:.2f}",
+                "終點價格":       "{:.2f}",
+                "區間報酬率%":    "{:+.2f}%",
+                "最大回撤(MDD)%": "{:.2f}%",
+            }).background_gradient(
+                subset=["區間報酬率%"], cmap="RdYlGn", vmin=-30, vmax=30
+            ),
+            use_container_width=True,  # ← 修正：原本 width='stretch' 是錯誤語法
+            height=450,
         )
-        st.caption(f"💡 註：若標的之『實際資料起點』晚於基準日 `{global_baseline}`，代表該商品於此區間中途才上市或取得資料。")
+        st.caption(
+            f"💡 若標的之『實際資料起點』晚於基準日 `{global_baseline}`，"
+            "代表該商品於此區間中途才上市或取得資料。"
+        )
 
     with col2:
         st.subheader("📈 頂尖績效標的比較圖")
-        
-        # 繪製報酬率最高的前 10 名
+
         top_n = df_res.head(10).sort_values(by="區間報酬率%", ascending=True)
-        
+
         fig, ax = plt.subplots(figsize=(10, 6))
-        
-        # 顏色邏輯：若未對齊大部隊起點則上黃色，其餘採台灣股市習慣（正報酬紅、負報酬綠）
+
         plot_colors = []
         for _, row in top_n.iterrows():
             if row["實際資料起點"] > global_baseline:
-                plot_colors.append('#eab308')  # 黃色：未對齊
+                plot_colors.append('#eab308')   # 黃：未對齊基準日
             elif row["區間報酬率%"] < 0:
-                plot_colors.append('#22c55e')  # 綠色：負報酬
+                plot_colors.append('#22c55e')   # 綠：負報酬（台股習慣）
             else:
-                plot_colors.append('#ef4444')  # 紅色：正報酬
-                
-        bars = ax.barh(top_n["股票代號"], top_n["區間報酬率%"], color=plot_colors, edgecolor='black', alpha=0.7)
-        
+                plot_colors.append('#ef4444')   # 紅：正報酬（台股習慣）
+
+        bars = ax.barh(
+            top_n["股票代號"], top_n["區間報酬率%"],
+            color=plot_colors, edgecolor='black', alpha=0.7
+        )
+
         for bar, (_, row) in zip(bars, top_n.iterrows()):
-            width = bar.get_width()
-            align = 'left' if width >= 0 else 'right'
-            offset = 0.5 if width >= 0 else -0.5
-            
-            label = f"{width:+.1f}%"
+            width  = bar.get_width()
+            align  = 'left' if width >= 0 else 'right'
+            offset = 0.5   if width >= 0 else -0.5
+            label  = f"{width:+.1f}%"
             if row["實際資料起點"] > global_baseline:
                 label += " *"
-                
-            ax.text(width + offset, bar.get_y() + bar.get_height()/2., label,
-                    ha=align, va='center', fontweight='bold',
-                    fontfamily=font_name if font_name else None)
-            
+            ax.text(
+                width + offset, bar.get_y() + bar.get_height() / 2.,
+                label, ha=align, va='center', fontweight='bold',
+                fontfamily=font_name if font_name else None,
+            )
+
         ax.axvline(0, color='black', linewidth=0.8)
         ax.grid(axis='x', linestyle='--', alpha=0.5)
+        ax.set_xlabel("區間報酬率 (%)")
         st.pyplot(fig)
         st.caption("圖例：🟥 正報酬 | 🟩 負報酬 | 🟨 區間內新上市/未對齊基準日 (*標記)")
+
 else:
     st.warning("選定時間區間內無足夠數據進行運算，請重新調整時間軸。")
