@@ -90,7 +90,7 @@ def load_master_market_data(tickers, preload_start, preload_end):
             st.error(f"❌ {ticker} 發生錯誤: {e}")
             
         # 禮貌性延遲 1 秒，避免觸發 FinMind 的頻率限制
-        # time.sleep(1)
+        time.sleep(1)
         
     # 清除進度條
     my_bar.empty()
