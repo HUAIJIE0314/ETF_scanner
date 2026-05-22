@@ -58,46 +58,83 @@ def get_finmind_price(ticker, start_date, end_date):
     return pd.DataFrame()
 
 # ==========================================
-# 3. 核心大數據預載機制 (全線改用 FinMind 防封鎖)
+# 3. 核心大數據預載機制 (終極雙引擎：Yahoo 主力 + FinMind 備援)
 # ==========================================
 @st.cache_data(show_spinner=True)
 def load_master_market_data(tickers, preload_start, preload_end):
     master_df = pd.DataFrame()
+    failed_tickers = [] # 用來收集失敗名單，避免黃字洗版
     
-    # 建立進度提示，讓你知道目前抓到哪一檔
-    progress_text = "📥 正在向 FinMind 請求歷史數據..."
+    progress_text = "📥 啟動雙引擎資料下載中 (Yahoo + FinMind)..."
     my_bar = st.progress(0, text=progress_text)
     
+    # 建立 Yahoo 專用的偽裝 Session
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    })
+    
     for i, ticker in enumerate(tickers):
-        # 更新進度條
-        percent_complete = int(((i + 1) / len(tickers)) * 100)
-        my_bar.progress(percent_complete, text=f"📥 正在下載: {ticker} ({i+1}/{len(tickers)})")
+        my_bar.progress(int(((i + 1) / len(tickers)) * 100), text=f"📥 正在下載: {ticker} ({i+1}/{len(tickers)})")
+        temp_df = pd.DataFrame()
         
+        # -----------------------------------------
+        # 引擎 1：Yahoo Finance (涵蓋率最廣，專治債券 ETF)
+        # -----------------------------------------
         try:
-            # 全部交給 FinMind 抓取 (函數內會自動濾除 .TW 後綴)
-            fm_df = get_finmind_price(ticker, preload_start, preload_end)
+            # 先嘗試上市代號 (.TW)
+            yf_data = yf.download(f"{ticker}.TW", start=preload_start, end=preload_end, progress=False, session=session)
             
-            if not fm_df.empty:
-                if master_df.empty:
-                    master_df = fm_df
-                else:
-                    # 使用 outer join 合併每一檔股票的時間軸
-                    master_df = master_df.join(fm_df, how='outer')
-            else:
-                st.warning(f"⚠️ 查無資料或抓取失敗: {ticker}")
+            # 如果空的，改嘗試上櫃代號 (.TWO)
+            if yf_data.empty:
+                yf_data = yf.download(f"{ticker}.TWO", start=preload_start, end=preload_end, progress=False, session=session)
                 
-        except Exception as e:
-            st.error(f"❌ {ticker} 發生錯誤: {e}")
-            
-        # 禮貌性延遲 1 秒，避免觸發 FinMind 的頻率限制
-        time.sleep(1)
+            if not yf_data.empty:
+                # 處理欄位降維
+                if isinstance(yf_data.columns, pd.MultiIndex):
+                    price_col = 'Adj Close' if 'Adj Close' in yf_data.columns.levels[0] else 'Close'
+                    temp_df = yf_data[price_col].copy()
+                else:
+                    temp_df = yf_data['Close'].to_frame()
+                    
+                temp_df.columns = [ticker] # 統一欄位名稱為純代號
+        except:
+            pass
+
+        # -----------------------------------------
+        # 引擎 2：FinMind 救援 (專治 Yahoo 查無的 ETN，如 02001L)
+        # -----------------------------------------
+        if temp_df.empty:
+            try:
+                fm_df = get_finmind_price(ticker, preload_start, preload_end)
+                if not fm_df.empty:
+                    temp_df = fm_df
+            except:
+                pass
+
+        # -----------------------------------------
+        # 合併至主表
+        # -----------------------------------------
+        if not temp_df.empty:
+            if master_df.empty:
+                master_df = temp_df
+            else:
+                master_df = master_df.join(temp_df, how='outer')
+        else:
+            # 兩個引擎都找不到，才宣告失敗
+            failed_tickers.append(ticker) 
+
+        # 禮貌性延遲 0.2 秒 (因為分散了 API 壓力，可以稍微縮短延遲)
+        time.sleep(0.2)
         
-    # 清除進度條
     my_bar.empty()
+    
+    # 集中印出失敗名單，還給版面清爽
+    if failed_tickers:
+        st.warning(f"⚠️ 以下 {len(failed_tickers)} 檔因資料源缺失、未上市或下市而無法取得：\n{', '.join(failed_tickers)}")
                 
     if not master_df.empty:
         master_df.index = pd.to_datetime(master_df.index)
-        # 向下/向上填補因各自休市或上市日不同造成的空值
         master_df = master_df.sort_index().ffill().bfill()
         
     return master_df
